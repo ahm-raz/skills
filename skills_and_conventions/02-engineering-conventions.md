@@ -777,4 +777,500 @@ Note the convention: middleware is a *coarse* gate; **every** server handler sti
 
 ---
 
+### 4.9 Authorization
+
+**What.** Conventions for deciding *what an authenticated identity may do to which resource*.
+
+**Why.** Broken authorization (especially object-level, "can user A read invoice B?") is consistently the top API security risk. It's rarely a missing library — it's inconsistency: one endpoint forgets the tenant filter.
+
+**Concrete convention:**
+
+1. **Deny by default.** No policy match → `403` (or `404` when existence must not be revealed).
+2. **Centralized policy.** All decisions go through `authz.assert(actor, action, resource)` / `authz.can(...)`. No inline `if (user.role === "admin")` in handlers.
+3. **Action naming:** `<resource>:<verb>` — `invoice:read`, `invoice:refund`, `member:invite`, `settings:billing:update`.
+4. **Tenant scoping by construction.** Repositories require `tenantId` as the first parameter; there is no method that queries tenant data without it. Postgres RLS as a backstop.
+5. **Authorize in the application layer**, after loading the resource and before mutating it — not in the UI, not only in middleware.
+6. **UI hides what's not allowed** using the same policy (`can()` results sent to the client), but the server is the enforcement point.
+7. **Role model:** RBAC for coarse roles (`owner`, `admin`, `member`, `viewer`) + attribute checks for ownership/state (e.g., `member` can edit own drafts only). Move to ReBAC (OpenFGA/SpiceDB) only when sharing/hierarchy demands it.
+8. **Privileged operations** (impersonation, refunds > threshold, data export) require explicit permission, reason capture, and audit log.
+9. **Internal admin tools** follow the same rules — they are not exempt.
+
+**Example — policy module:**
+
+```ts
+// src/shared/authz/policy.ts
+type Role = "owner" | "admin" | "member" | "viewer";
+type Actor = { userId: string; tenantId: string; role: Role };
+
+type Rule<R> = (actor: Actor, resource: R) => boolean;
+
+const sameTenant = (a: Actor, r: { tenantId: string }) => a.tenantId === r.tenantId;
+
+export const policies = {
+  "invoice:read":   ((a, r) => sameTenant(a, r)) as Rule<{ tenantId: string }>,
+  "invoice:refund": ((a, r) => sameTenant(a, r) && (a.role === "owner" || a.role === "admin")) as Rule<{ tenantId: string }>,
+  "draft:update":   ((a, r) => sameTenant(a, r) && (a.role !== "viewer") && (a.role !== "member" || r.authorId === a.userId)) as Rule<{ tenantId: string; authorId: string }>,
+} as const;
+
+export type Action = keyof typeof policies;
+
+export function assert<A extends Action>(actor: Actor, action: A, resource: Parameters<(typeof policies)[A]>[1]) {
+  if (!policies[action](actor, resource as never)) {
+    throw new AppError("forbidden", 403);
+  }
+}
+```
+
+**Example — authorization test matrix (generated, not hand-written per endpoint):**
+
+```ts
+describe.each([
+  ["owner",  "invoice:refund", true],
+  ["admin",  "invoice:refund", true],
+  ["member", "invoice:refund", false],
+  ["viewer", "invoice:refund", false],
+])("%s → %s", (role, action, allowed) => {
+  it(allowed ? "is allowed" : "is denied", () => { /* ... */ });
+});
+
+it("denies cross-tenant access for every role", async () => {
+  for (const role of ROLES) {
+    const res = await api.as(role, tenantA).get(`/v1/invoices/${invoiceOfTenantB.id}`);
+    expect(res.status).toBe(404);
+  }
+});
+```
+
+**Enforcement.** Repository type signatures requiring `tenantId`; RLS test from 4.5; cross-tenant E2E tests for every resource route; code review checklist item "authorization happens after load, before mutation."
+
+**Expert mental model.** *"Authentication asks who you are. Authorization must be asked for every object, every time, in one place."*
+
+**Common mistake.** Checking role but not ownership/tenant: "admins can refund" becomes "admins of *any* tenant can refund *any* invoice."
+
+---
+
+### 4.10 Logging
+
+**What.** Conventions for log format, levels, fields, correlation, sensitive-data handling, and retention.
+
+**Why.** Logs are the primary forensic tool during incidents and audits. Unstructured, uncorrelated, inconsistent logs make investigations slow and dashboards impossible.
+
+**Concrete convention:**
+
+**Format:** JSON, one event per line, via `pino` (Node). Human-pretty formatting only in local dev.
+
+**Required fields (every log line):**
+
+| Field | Example | Source |
+|---|---|---|
+| `timestamp` | `2026-09-15T10:15:00.123Z` | logger |
+| `level` | `info` | logger |
+| `service` | `orders-api` | config |
+| `env` | `production` | config |
+| `version` | `git sha` | build |
+| `trace_id` / `span_id` | `4bf92f3577b34da6a3ce929d0e0e4736` | OpenTelemetry context |
+| `request_id` | `req_01J8ZM...` | middleware |
+| `event` | `order.placed` | call site (stable, dot-namespaced) |
+| `msg` | `order placed` | call site (human readable) |
+
+**Contextual fields (when applicable):** `tenant_id`, `user_id` (internal ID, never email), `order_id`/resource IDs, `job_id`, `attempt`, `duration_ms`, `http.method`, `http.route` (template, not raw path), `http.status`, `err.code`, `err.stack`.
+
+**Levels:**
+
+| Level | Use | Example |
+|---|---|---|
+| `error` | A bug or failure requiring attention; would page if rate elevated | Unhandled exception, invariant violation, DLQ message |
+| `warn` | Expected failure or degraded operation | Validation error, retrying dependency, fallback used |
+| `info` | Significant business/lifecycle events | `order.placed`, `job.completed`, server started |
+| `debug` | Diagnostic detail; off in production by default | Cache hit/miss details |
+
+**Never log:** passwords, tokens, API keys, session IDs, full card numbers (PAN), CVV, full request bodies of auth/payment endpoints, government IDs, raw emails/phones where avoidable. Use redaction:
+
+```ts
+// src/shared/lib/logger.ts
+import pino from "pino";
+
+export const logger = pino({
+  level: env.LOG_LEVEL,
+  base: { service: env.SERVICE_NAME, env: env.NODE_ENV, version: env.GIT_SHA },
+  timestamp: pino.stdTimeFunctions.isoTime,
+  redact: {
+    paths: [
+      "req.headers.authorization", "req.headers.cookie", "*.password", "*.token",
+      "*.apiKey", "*.cardNumber", "*.cvv", "*.secret", "*.email",
+    ],
+    censor: "[REDACTED]",
+  },
+  formatters: { level: (label) => ({ level: label }) },
+});
+```
+
+**Audit logs are not application logs.** Security- and business-relevant actions (role changed, refund issued, data exported, impersonation started) go to an append-only `audit_events` table with actor, action, target, before/after, IP, and reason — retained per compliance needs, queryable by support.
+
+**Enforcement.** Logger is the only allowed output (`no-console` lint rule outside scripts); log schema test in CI for key events; redaction test that logs a fixture with secrets and asserts they're censored.
+
+**Expert mental model.** *"Log events, not prose. Every log line should be queryable by the question I'll ask during an incident."*
+
+**Common mistake.** Interpolating values into message strings (`"Order " + id + " failed for " + email`) — unqueryable, and leaks PII.
+
+---
+
+### 4.11 Testing
+
+**What.** Conventions for test types, locations, naming, data setup, dependencies, and what "tested" means.
+
+**Why.** Without conventions, test suites become inconsistent (some mock the DB, some don't), slow, flaky, and untrusted — and untrusted tests are ignored.
+
+**Concrete convention — test portfolio:**
+
+| Type | Scope | Tool | Dependencies | Location | Runs |
+|---|---|---|---|---|---|
+| Unit | Pure domain logic, utilities | Vitest | None (no I/O) | Colocated `*.test.ts` | Every commit, < 30s |
+| Property | Invariants of domain functions | Vitest + fast-check | None | Colocated `*.property.test.ts` | Every commit |
+| Integration | Use cases, repositories, route handlers | Vitest + Testcontainers Postgres | Real DB, fake external APIs (MSW) | Colocated `*.int.test.ts` | Every PR |
+| Contract | API schema, consumer/provider, error envelope | Schemathesis / Pact / JSON schema | Running app | `tests/contract` | Every PR |
+| Component | React components behavior | Vitest + Testing Library | MSW | Colocated `*.test.tsx` | Every PR |
+| E2E | Critical user journeys (≤ 15) | Playwright | Full stack, seeded DB | `tests/e2e` | Every PR (smoke), full nightly |
+| Accessibility | Pages & components | axe via Playwright | Full stack | `tests/e2e/a11y` | Every PR |
+| Load | Critical endpoints | k6 | Staging | `tests/load` | Before major releases / weekly |
+| Migration | All migrations apply cleanly | Custom script | Empty Postgres | CI job | Every PR |
+
+**Naming:** describe behavior, not implementation.
+
+```ts
+describe("cancelOrder", () => {
+  it("releases reserved stock when an allocated order is cancelled", ...);
+  it("rejects cancellation once the order has shipped with order_not_cancellable", ...);
+  it("is idempotent when the same cancellation is submitted twice", ...);
+  it("returns not_found for orders belonging to another tenant", ...);
+});
+```
+
+**Data setup:** factories, not shared fixtures.
+
+```ts
+const tenant = await factories.tenant();
+const order = await factories.order({ tenantId: tenant.id, status: "allocated", lines: [{ sku: "A-1", quantity: 2 }] });
+```
+
+**Rules:**
+1. Each test creates its own data; tests run in parallel; no ordering dependencies.
+2. Mock only what you don't own and can't run (payment processors, carriers) — using MSW at the HTTP layer, not by mocking your own modules.
+3. Every bug fix ships with a test that failed before the fix.
+4. Every critical invariant in `docs/invariants.md` links to at least one test.
+5. Flaky test → quarantined within 24h with an owner and an issue; quarantine > 14 days is escalated.
+6. Coverage is a *signal*, not a goal: enforce a floor (e.g., 80% on `domain/` and `application/`), don't reward chasing 100%.
+7. Time and randomness are injected (`clock`, `idGenerator`) — no `Date.now()` in domain code.
+
+**Enforcement.** CI jobs per tier; Vitest coverage thresholds per path; `--retry=0` in CI (retries hide flakiness); lint rule preventing `.only`.
+
+```ts
+// vitest.config.ts (excerpt)
+coverage: {
+  provider: "v8",
+  thresholds: {
+    "src/modules/**/domain/**": { lines: 90, branches: 85 },
+    "src/modules/**/application/**": { lines: 80, branches: 75 },
+  },
+},
+```
+
+**Expert mental model.** *"Test conventions exist so a green build means the same thing in every module: the behaviors that matter still hold."*
+
+**Common mistake.** Mocking the database in "integration" tests, so constraint violations, transaction behavior, and SQL errors only appear in production.
+
+---
+
+### 4.12 Git
+
+**What.** Conventions for repository hygiene: what is committed, history policy, ignored files, large files, tags, and protections.
+
+**Why.** Git history is an audit trail and a debugging tool (`git bisect`, `git blame`). Committed secrets are effectively permanent leaks. Messy history destroys both uses.
+
+**Concrete convention:**
+
+| Concern | Convention |
+|---|---|
+| Default branch | `main`, protected: no direct pushes, required status checks, required review (for teams), linear history |
+| Merge strategy | Squash-merge PRs (one commit per PR on `main`) *or* rebase-merge with clean commits — pick one per repo |
+| Never committed | `.env*` (except `.env.example`), credentials, build output, `node_modules`, large binaries, local DB dumps, customer data |
+| Secrets scanning | Pre-commit `gitleaks` + GitHub push protection; leaked secret → **rotate first**, then purge history |
+| Large files | Git LFS or object storage; nothing > 5MB in repo |
+| Line endings | `.gitattributes` with `* text=auto eol=lf` (critical for Windows + Linux teams) |
+| Signed commits | Required for `main` in regulated contexts |
+| Tags | Releases tagged `vMAJOR.MINOR.PATCH` by automation only |
+| Force push | Never on `main`/release branches; allowed on your own feature branches |
+| Hooks | Managed via `lefthook` or `husky`: pre-commit (format staged, lint staged, gitleaks), commit-msg (commitlint) |
+
+```gitattributes
+# .gitattributes
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary
+pnpm-lock.yaml -diff linguist-generated
+```
+
+```yaml
+# lefthook.yml
+pre-commit:
+  parallel: true
+  commands:
+    format:   { glob: "*.{ts,tsx,js,json,md,css}", run: "pnpm prettier --write {staged_files}", stage_fixed: true }
+    lint:     { glob: "*.{ts,tsx}", run: "pnpm eslint --max-warnings=0 {staged_files}" }
+    secrets:  { run: "gitleaks protect --staged --redact" }
+commit-msg:
+  commands:
+    commitlint: { run: "pnpm commitlint --edit {1}" }
+```
+
+**Enforcement.** Branch protection rules (as code via Terraform GitHub provider or rulesets), hooks, push protection.
+
+**Expert mental model.** *"History is a production artifact. Keep it clean enough to bisect and safe enough to publish."*
+
+**Common mistake.** Committing a secret, deleting it in the next commit, and assuming it's gone. It's in history, forks, and CI caches — rotate it.
+
+---
+
+### 4.13 Branching
+
+**What.** The model for how work flows through branches to production.
+
+**Why.** Branching strategy determines integration frequency, merge conflict pain, release flexibility, and how quickly fixes reach users.
+
+**Concrete convention — trunk-based development (default recommendation):**
+
+```text
+main ────●────●────●────●────●────●────▶  (always deployable; deploys continuously)
+          \  /      \  /      \  /
+  feat/ORD-142   fix/PAY-88   chore/deps
+  (hours–2 days)
+```
+
+- Short-lived branches off `main`; merge within 1–2 days.
+- Incomplete features merged behind **feature flags**, not held in long branches.
+- `main` is always releasable; every merge deploys to staging, production by automated promotion or one click.
+- **Branch names:** `<type>/<ticket>-<short-description>` → `feat/ORD-142-partial-refunds`, `fix/PAY-88-webhook-idempotency`, `chore/upgrade-next-15`.
+- **Hotfixes:** same flow (branch from `main`, fast-track review). If a deployed version must be patched while `main` has unreleased risky changes, cut `release/v2.14` from the tag, cherry-pick, and merge fix back to `main`.
+
+**When a different model is justified:**
+
+| Model | Justified when | Cost |
+|---|---|---|
+| Trunk-based | Web apps/services with CI/CD and feature flags | Requires good tests and flags |
+| Release branches | Mobile apps (store review), on-prem software, multiple supported versions | Cherry-pick overhead, drift |
+| GitFlow (develop/release/hotfix) | Rarely today; scheduled releases with long stabilization | Long-lived branches, merge pain, slow feedback |
+| Environment branches (`staging`, `prod`) | Almost never — deploy artifacts, not branches | Divergent code per environment |
+
+**Enforcement.** Branch name check in CI; stale branch bot (warn at 3 days, close at 30); required up-to-date with `main` before merge (or merge queue).
+
+**Expert mental model.** *"Integration pain grows with branch age. Merge small, merge often, hide incomplete work behind flags, not branches."*
+
+**Common mistake.** Long-lived feature branches ("the big refactor branch") that diverge for weeks and become impossible to merge safely.
+
+---
+
+### 4.14 Commits
+
+**What.** Conventions for commit size, content, and message format.
+
+**Why.** Commit messages feed changelogs, semantic versioning, `git blame` archaeology, and incident timelines. Atomic commits make revert and bisect precise.
+
+**Concrete convention — Conventional Commits:**
+
+```text
+<type>(<scope>): <imperative summary, ≤ 72 chars, no period>
+
+<body: WHY this change, what problem, notable trade-offs; wrap at 72>
+
+<footer: BREAKING CHANGE: ..., Refs: ORD-142, Co-authored-by: ...>
+```
+
+**Types:** `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`, `security`.
+**Scopes:** module names — `orders`, `billing`, `auth`, `ui`, `infra`, `db`.
+
+**Examples:**
+
+```text
+feat(billing): support partial refunds on captured payments
+
+Customers could only refund full orders, forcing support to issue
+manual credits for single returned items (≈40 tickets/week).
+
+Refunds are recorded as ledger entries; the sum of refunds is
+constrained to never exceed the captured amount (ck_refunds_le_capture).
+
+Refs: BILL-311
+```
+
+```text
+fix(orders): make webhook handler idempotent on duplicate delivery
+
+Stripe retried invoice.paid after a 12s timeout, extending two
+subscriptions twice. Events are now recorded in processed_webhook_events
+(unique event_id) in the same transaction as the side effect.
+
+Refs: PAY-88
+```
+
+```text
+feat(api)!: return money as {amount, currency} objects
+
+BREAKING CHANGE: `totalCents` and `currency` fields on Order are replaced
+by `total: { amount, currency }`. v1 clients remain on the old shape
+until 2027-03-31 via the /v1 compatibility serializer.
+```
+
+**Rules:**
+1. One logical change per commit; refactors separate from behavior changes.
+2. Every commit on `main` builds and passes tests (bisectable).
+3. The body explains **why**; the diff explains what.
+4. No "wip", "fix stuff", "address review comments" on `main` (squash them).
+
+**Enforcement.** `commitlint` with `@commitlint/config-conventional` in `commit-msg` hook and in CI for PR titles (when squash-merging, the PR title becomes the commit):
+
+```js
+// commitlint.config.js
+export default {
+  extends: ["@commitlint/config-conventional"],
+  rules: {
+    "scope-enum": [2, "always", ["orders", "billing", "auth", "catalog", "ui", "api", "db", "infra", "deps", "ci"]],
+    "subject-case": [2, "never", ["upper-case", "pascal-case", "start-case"]],
+    "header-max-length": [2, "always", 72],
+  },
+};
+```
+
+Then `semantic-release` or `changesets` generates versions and changelogs.
+
+**Expert mental model.** *"A commit message is a note to the engineer debugging an incident in two years. Tell them why."*
+
+**Common mistake.** Mixing a formatting sweep, a refactor, and a bug fix in one commit — impossible to review, impossible to revert selectively.
+
+---
+
+### 4.15 Pull Requests
+
+**What.** Conventions for PR size, description, readiness, checks, and merge criteria.
+
+**Why.** The PR is where code becomes shared responsibility. Good PR conventions make review fast and effective; bad ones make it a formality.
+
+**Concrete convention:**
+
+| Concern | Convention |
+|---|---|
+| Size | Target < 400 changed lines of non-generated code; > 800 requires justification or splitting |
+| Scope | One purpose per PR; no "while I was here" changes |
+| Title | Conventional Commit format (becomes squash commit) |
+| Draft | Open as draft early for design feedback; mark ready when checks pass |
+| Description | Template: context, change summary, risk, testing evidence, rollout/rollback, screenshots for UI |
+| Checks | All required CI green before requesting review |
+| Self-review | Author reviews own diff first and annotates non-obvious parts |
+| Migrations | Called out explicitly; backward compatible with currently deployed code |
+| Review SLA | First response within 1 business day (4h target) |
+| Approval | ≥ 1 approval; CODEOWNERS for sensitive paths (`auth/`, `billing/`, `db/migrations/`, `infra/`) |
+| Merge | Author merges after approval (they own the rollout) |
+
+**PR template** (full version in [templates/pull-request.md](templates/pull-request.md)):
+
+```md
+## Why
+<!-- Problem, user impact, link to issue/ADR -->
+
+## What changed
+<!-- Bullet summary; point reviewers to the important files -->
+
+## Risk
+- [ ] Touches authentication/authorization
+- [ ] Touches money, inventory, or other invariants (list them)
+- [ ] Database migration (backward compatible with current prod? Y/N)
+- [ ] Changes a public API/contract
+- [ ] New dependency (name, why, license, maintenance status)
+
+## How I verified
+<!-- Tests added, manual steps, screenshots, query plans, load test numbers -->
+
+## Rollout & rollback
+<!-- Feature flag? Canary? What to watch (dashboard link)? How to roll back? -->
+```
+
+**Enforcement.** Template auto-applied; CI "PR size" check labels large PRs; `danger.js` rules (e.g., migration changed but no mention in description → fail; `package.json` changed without lockfile → fail):
+
+```ts
+// dangerfile.ts
+import { danger, fail, warn } from "danger";
+const touched = [...danger.git.modified_files, ...danger.git.created_files];
+if (touched.some(f => f.startsWith("db/migrations/")) && !/migration/i.test(danger.github.pr.body)) {
+  fail("This PR adds a migration. Describe backward compatibility in the Risk section.");
+}
+if (touched.includes("package.json") && !touched.includes("pnpm-lock.yaml")) {
+  fail("package.json changed without pnpm-lock.yaml.");
+}
+const { additions, deletions } = danger.github.pr;
+if (additions + deletions > 800) warn("Large PR (>800 lines). Consider splitting.");
+```
+
+**Expert mental model.** *"A PR is a request for someone to share responsibility for a production change. Make it cheap for them to do that well."*
+
+**Common mistake.** Descriptions like "fixes bug" — the reviewer must reverse-engineer intent from the diff, so they review the syntax instead of the design.
+
+---
+
+### 4.16 Code Review
+
+**What.** Conventions for how reviewers review: priorities, comment labels, tone, turnaround, and what's delegated to automation.
+
+**Why.** Review conventions keep review focused on high-value issues, prevent both rubber-stamping and bikeshedding, and make feedback unambiguous.
+
+**Concrete convention:**
+
+**Review priority order** (spend attention top-down):
+
+```text
+1. Correctness & invariants     — Does it do the right thing? What must stay true?
+2. Security                     — AuthZ on every path? Input parsed? Data exposure?
+3. Failure handling             — Timeouts? Retries safe? Idempotent? Partial failure?
+4. Data & migrations            — Constraints? Backward compatible? Locks?
+5. Design fit                   — Right module? Right boundary? Follows conventions?
+6. Tests                        — Do tests prove the risky behavior? Would they fail if it broke?
+7. Operability                  — Logs/metrics for new paths? Rollback plan?
+8. Readability                  — Could someone else safely change this?
+9. Style                        — Should be automated; humans shouldn't comment on it
+```
+
+**Comment labels** (inspired by Conventional Comments):
+
+| Label | Meaning | Blocks merge? |
+|---|---|---|
+| `blocking:` | Must be addressed | Yes |
+| `question:` | Reviewer needs understanding; may become blocking | Until answered |
+| `suggestion:` | Improvement worth considering | No |
+| `nit:` | Minor, optional | No |
+| `praise:` | Something done well, worth repeating | No |
+| `followup:` | Valid but out of scope → create issue | No |
+
+**Tone rules:** comment on code, not people; explain *why*; offer a concrete alternative; ask before assuming ("Is there a reason we don't lock here?").
+
+**Reviewer checklist for high-risk areas:**
+
+```text
+□ Every new data access is tenant/owner scoped
+□ Every new external call has a timeout
+□ Every new mutation reachable by retry/webhook/queue is idempotent
+□ Every new status transition is legal per the state machine
+□ Migration is safe to run while the old version is still serving traffic
+□ No secrets, PII, or tokens in logs, errors, or client bundles
+□ New env vars added to env schema and .env.example
+□ Errors use AppError codes; no swallowed exceptions
+□ Tests would fail if the core behavior regressed
+```
+
+**Enforcement.** CODEOWNERS; required reviews; formatting/lint/type/security checks automated so humans skip them; review latency dashboard; AI review bots as first pass (not approval) — see [13-ai-and-agents.md](13-ai-and-agents.md).
+
+**Expert mental model.** *"Review what machines can't: intent, invariants, failure, and fit. If a human comments on formatting, a tool is missing."*
+
+**Common mistake.** Approving large PRs quickly because "it's too big to review properly" — the largest changes carry the most risk and get the least scrutiny.
+
+---
+
 <!-- CONTINUE -->
