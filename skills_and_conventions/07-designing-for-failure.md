@@ -1812,4 +1812,656 @@ The same principle applies to **APIs and events**: add fields before using them;
 - Rollback plan = "revert the commit" when the migration already dropped a column.
 - Friday-afternoon deploys with no canary and no one watching.
 
-<!-- CONTINUE -->
+---
+
+## 16. Feature Flags and Rollbacks
+
+### What
+
+- **Feature flag:** a runtime switch that separates **deploying** code from **releasing** behavior.
+- **Rollback:** returning to a previous known-good state — of code (redeploy previous artifact), config (revert flag), or data (restore / repair).
+- **Roll forward:** shipping a fix instead of reverting, when rollback is unsafe or slower.
+
+### Why
+
+Rolling back a binary takes minutes and may be blocked by migrations; flipping a flag takes seconds. Flags also enable progressive exposure (internal users → 1% → 10% → 100%), which turns a potential full outage into a small, detectable one.
+
+### How
+
+Flag types and lifecycle:
+
+| Type | Purpose | Lifetime | Example |
+|---|---|---|---|
+| Release flag | Hide incomplete/new feature | Days–weeks, then delete | `new_checkout_flow` |
+| Ops / kill switch | Disable expensive or risky behavior under incident | Permanent | `disable_recommendations`, `read_only_mode` |
+| Experiment | A/B test | Weeks | `pricing_page_variant` |
+| Permission / entitlement | Plan-based access | Permanent (but belongs in authz, not flags) | `plan_has_sso` |
+
+Rules:
+- Flags are evaluated **server-side** for anything security- or money-relevant.
+- Every release flag has an owner and a removal ticket; CI warns on flags older than N days.
+- Kill switches are **tested** (flip them in staging regularly).
+- The flag service itself can fail: define a **safe default** in code for each flag when the flag provider is unreachable.
+- Log flag evaluations (or at least flag state changes) so incidents can correlate "what changed".
+
+```ts
+// Safe defaults when the flag service is down
+const DEFAULTS = {
+  new_checkout_flow: false,         // new feature: default off
+  disable_recommendations: false,   // kill switch: default "feature on"
+  read_only_mode: false,
+} as const;
+
+export async function flag<K extends keyof typeof DEFAULTS>(key: K, ctx: { tenantId: string; userId?: string }) {
+  try {
+    return await flagClient.boolVariation(key, ctx, DEFAULTS[key], { timeoutMs: 50 });
+  } catch {
+    metrics.flagFallback.inc({ key });
+    return DEFAULTS[key];
+  }
+}
+```
+
+Progressive rollout with automated guardrail:
+
+```text
+Stage       Exposure   Duration   Guardrail (auto-revert if breached)
+internal    staff      1 day      error rate, manual QA
+canary      1%         1 hour     checkout success rate within -0.5% of control; p95 latency +10% max
+early       10%        1 day      same + payment decline rate
+general     50%→100%   2 days     same
+cleanup     remove flag and old code path within 2 weeks
+```
+
+Rollback decision tree:
+
+```text
+Incident correlated with a change?
+├─ Change behind a flag → flip flag off (seconds). Done; investigate calmly.
+├─ Code deploy, no incompatible migration → roll back to previous artifact.
+├─ Code deploy with expand-only migration → roll back code; leave schema (it's backward compatible).
+├─ Destructive migration or data already written in new format → ROLL FORWARD with fix;
+│   if data damaged → repair script or PITR to side database + targeted restore.
+└─ Config change (env var, infra) → revert via IaC (git revert + apply), not console clicks.
+```
+
+### Expert Mental Model
+
+> "Every risky change should have an 'off' switch that is faster than the damage it can cause."
+
+### Common Mistake
+
+- Flags that never get removed → combinatorial explosion of untested code paths (Knight Capital's 2012 $440M loss involved repurposing an old flag that reactivated dead code on one server that missed a deploy).
+- Client-side-only flags guarding server behavior.
+- Rollback never practiced → the artifact for the previous version was garbage-collected, or the deploy pipeline can only go forward.
+
+---
+
+## 17. Backups, Verified Restores, RTO and RPO
+
+### What
+
+- **Backup:** a copy of data from which you *might* be able to restore.
+- **Verified restore:** a backup you have *actually restored* recently, measured, and checked for correctness. Only this counts.
+- **RPO (Recovery Point Objective):** maximum acceptable data loss, measured in time ("we can lose at most 5 minutes of writes").
+- **RTO (Recovery Time Objective):** maximum acceptable time to restore service ("back within 1 hour").
+
+### Why
+
+Replication is not backup: a `DELETE FROM orders` without `WHERE` replicates to every replica in milliseconds. Ransomware, a compromised credential, a buggy migration, or a cloud-account deletion can destroy both primary and replicas. Untested backups routinely fail when needed: wrong retention, missing WAL segments, encryption keys lost, restore takes 14 hours instead of 1.
+
+### How
+
+Define RPO/RTO **per data class**, driven by business impact:
+
+| Data | RPO | RTO | Mechanism |
+|---|---|---|---|
+| Payments ledger, orders | ≤ 1 min | ≤ 1 h | Managed PG with PITR (continuous WAL archiving), cross-region replica, daily snapshot copied to separate account |
+| User uploads (S3) | ≤ 15 min | ≤ 4 h | Versioning + Object Lock + cross-region replication |
+| Analytics warehouse | 24 h | 24 h | Rebuild from source events |
+| Cache (Redis) | N/A | Minutes | Rebuildable; no backup needed |
+| Search index | N/A | Hours | Reindex from primary DB |
+
+Backup principles:
+- **3-2-1:** 3 copies, 2 different media/services, 1 offsite — plus **1 immutable/air-gapped** copy (separate cloud account, object lock, different credentials).
+- **Point-in-time recovery (PITR)** for transactional databases: base backups + WAL archive (pgBackRest, WAL-G, or managed RDS/Cloud SQL/Neon PITR).
+- **Encrypt** backups; store keys separately; ensure key access survives the loss of the primary account.
+- **Restore drills** on a schedule, automated, with measured duration and data validation.
+
+### Example — automated restore verification job (conceptual, AWS RDS)
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# Runs weekly in CI/scheduler. Restores latest PITR to a temp instance, validates, records RTO, tears down.
+
+START=$(date +%s)
+RESTORE_ID="restore-verify-$(date +%Y%m%d%H%M)"
+
+aws rds restore-db-instance-to-point-in-time \
+  --source-db-instance-identifier prod-orders \
+  --target-db-instance-identifier "$RESTORE_ID" \
+  --use-latest-restorable-time \
+  --db-instance-class db.r6g.large \
+  --no-publicly-accessible \
+  --db-subnet-group-name restore-verify-subnets
+
+aws rds wait db-instance-available --db-instance-identifier "$RESTORE_ID"
+HOST=$(aws rds describe-db-instances --db-instance-identifier "$RESTORE_ID" --query 'DBInstances[0].Endpoint.Address' --output text)
+
+# Validation queries: freshness, row-count sanity, invariants
+psql "host=$HOST dbname=orders user=restore_verifier sslmode=require" -v ON_ERROR_STOP=1 <<'SQL'
+SELECT CASE WHEN max(created_at) > now() - interval '15 minutes' THEN 'ok' ELSE 'STALE' END AS freshness FROM orders;
+SELECT count(*) > 1000000 AS plausible_row_count FROM orders;
+-- Ledger invariant must hold on the restored copy too
+SELECT count(*) = 0 AS ledger_balanced FROM (
+  SELECT transfer_id FROM ledger_entries GROUP BY transfer_id HAVING sum(amount_minor) <> 0
+) x;
+SQL
+
+END=$(date +%s)
+echo "restore_duration_seconds $((END-START))" | curl --data-binary @- "$PUSHGATEWAY/metrics/job/restore_verify"
+
+aws rds delete-db-instance --db-instance-identifier "$RESTORE_ID" --skip-final-snapshot
+```
+
+Alert if the job fails or if `restore_duration_seconds` exceeds the RTO.
+
+### Targeted data recovery (the common real case)
+
+Full restores are rare. The common incident is "a bug corrupted 3,000 rows yesterday at 14:02". Procedure:
+
+```text
+1. Stop the bleeding: disable the feature / flag; confirm no further corruption.
+2. Scope: identify affected rows via audit log / updated_at / deploy time window.
+3. PITR restore to a SIDE instance at 14:01 (never overwrite production).
+4. Extract correct values for affected rows from the side instance.
+5. Write a repair script: idempotent, dry-run mode, outputs a diff, reviewed by a second engineer.
+6. Apply in batches with an audit entry per change; verify invariants.
+7. Postmortem: why did constraints/tests/reconciliation not catch it earlier?
+```
+
+### Expert Mental Model
+
+> "Nobody cares about backups. They care about restores. A restore I haven't timed and validated is a hope, not a capability."
+
+### Common Mistake
+
+- Backups in the same account/credentials as production (one compromised key deletes both).
+- Only daily snapshots when the business assumes near-zero data loss (RPO mismatch nobody wrote down).
+- Never restoring until a real disaster.
+- Forgetting non-DB state: object storage, secrets, DNS config, IaC state files, queue contents.
+
+---
+
+## 18. Race Conditions and Deadlocks in PostgreSQL
+
+### What
+
+- **Race condition:** correctness depends on the timing/interleaving of concurrent operations.
+- **Lost update:** two transactions read the same value and both write based on it; one write is lost.
+- **Write skew:** two transactions read overlapping data, each makes a decision valid in isolation, and together they violate an invariant (e.g. two doctors both go off-call because each saw the other on call).
+- **Deadlock:** two or more transactions each wait for locks held by the other. PostgreSQL detects cycles after `deadlock_timeout` and aborts one (`40P01`).
+
+### Why
+
+Under `READ COMMITTED` (PostgreSQL's default), the classic read-modify-write code is broken. It works in development (one user) and fails in production (concurrency). These bugs are rare per request, catastrophic in effect (overselling, double-spending, negative balances), and hard to reproduce.
+
+### How — techniques for race conditions (ranked by preference)
+
+**1. Atomic conditional update (best for counters/balances):**
+
+```sql
+-- Oversell-proof stock decrement: the check and the write happen atomically in one statement
+UPDATE inventory
+   SET available = available - $2
+ WHERE sku_id = $1 AND warehouse_id = $3 AND available >= $2
+RETURNING available;
+-- rowCount = 0 → insufficient stock (no race possible)
+```
+
+**2. Constraints (the backstop that can't be forgotten):**
+
+```sql
+ALTER TABLE inventory ADD CONSTRAINT available_non_negative CHECK (available >= 0);
+CREATE UNIQUE INDEX one_active_subscription_per_account ON subscriptions (account_id) WHERE status = 'active';
+-- No overlapping bookings for the same room (requires btree_gist)
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings ADD CONSTRAINT no_overlap EXCLUDE USING gist (room_id WITH =, during WITH &&);
+```
+
+**3. Pessimistic locking (`SELECT ... FOR UPDATE`) when logic can't be one statement:**
+
+```ts
+await db.tx(async (tx) => {
+  const { rows: [acct] } = await tx.query(
+    `SELECT id, balance_minor, daily_limit_minor, spent_today_minor FROM accounts WHERE id = $1 FOR UPDATE`,
+    [accountId],
+  );
+  if (acct.spent_today_minor + amount > acct.daily_limit_minor) throw new LimitExceededError();
+  // complex rule evaluation in application code, row is locked meanwhile
+  await tx.query(`UPDATE accounts SET balance_minor = balance_minor - $2, spent_today_minor = spent_today_minor + $2 WHERE id = $1`,
+    [accountId, amount]);
+});
+```
+
+**4. Optimistic concurrency (version column) for user-facing edits with long think time:**
+
+```sql
+UPDATE documents SET body = $1, version = version + 1, updated_at = now()
+ WHERE id = $2 AND version = $3;
+-- rowCount = 0 → someone else saved first → return 409 Conflict, UI shows merge/reload
+```
+
+**5. `SERIALIZABLE` isolation for complex invariants across rows (write skew), with retry:**
+
+```ts
+await withRetry(() => db.tx({ isolation: 'serializable' }, async (tx) => {
+  const { rows: [{ on_call }] } = await tx.query(
+    `SELECT count(*)::int AS on_call FROM shifts WHERE ward_id = $1 AND on_call = true`, [wardId]);
+  if (on_call <= 1) throw new InvariantViolation('ward must have at least one doctor on call');
+  await tx.query(`UPDATE shifts SET on_call = false WHERE doctor_id = $1 AND ward_id = $2`, [doctorId, wardId]);
+}), { maxAttempts: 5, baseMs: 20, capMs: 500, retryOn: (e) => (e as any).code === '40001' });
+```
+
+**6. Advisory locks for "only one of this job at a time":**
+
+```sql
+SELECT pg_try_advisory_xact_lock(hashtext('monthly-invoicing:2026-09'));  -- false → another run is active
+```
+
+**7. Job queue claiming with `FOR UPDATE SKIP LOCKED`:**
+
+```sql
+WITH next AS (
+  SELECT id FROM jobs
+   WHERE status = 'queued' AND run_at <= now()
+   ORDER BY priority DESC, run_at
+   LIMIT 10
+   FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs j SET status = 'running', locked_by = $1, locked_at = now(), attempts = attempts + 1
+  FROM next WHERE j.id = next.id
+RETURNING j.*;
+```
+
+### How — deadlocks
+
+Deadlock example:
+
+```text
+T1: UPDATE accounts SET ... WHERE id = 'A';   -- locks A
+T2: UPDATE accounts SET ... WHERE id = 'B';   -- locks B
+T1: UPDATE accounts SET ... WHERE id = 'B';   -- waits for T2
+T2: UPDATE accounts SET ... WHERE id = 'A';   -- waits for T1 → cycle → PG aborts one with 40P01
+```
+
+Prevention by **consistent lock ordering**:
+
+```ts
+export async function transfer(fromId: string, toId: string, amount: number) {
+  const [first, second] = [fromId, toId].sort();         // always lock in ascending id order
+  await withRetry(() => db.tx(async (tx) => {
+    await tx.query(`SELECT id FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE`, [[first, second]]);
+    const debit = await tx.query(
+      `UPDATE accounts SET balance_minor = balance_minor - $2 WHERE id = $1 AND balance_minor >= $2`, [fromId, amount]);
+    if (debit.rowCount !== 1) throw new InsufficientFundsError();
+    await tx.query(`UPDATE accounts SET balance_minor = balance_minor + $2 WHERE id = $1`, [toId, amount]);
+  }), { maxAttempts: 3, baseMs: 10, capMs: 200, retryOn: isRetryableDbError });
+}
+```
+
+Other deadlock sources and fixes:
+
+| Source | Fix |
+|---|---|
+| Batch updates touching rows in arbitrary order | `ORDER BY id` in the locking `SELECT ... FOR UPDATE` or the CTE driving the update |
+| Foreign-key checks taking `FOR KEY SHARE` on parent rows while another tx updates parent | Lock parent first consistently; avoid updating parent key columns |
+| Long transactions holding locks while doing app work | Shorten transactions; no network calls inside |
+| DDL waiting for `ACCESS EXCLUSIVE` behind long reads, blocking everything behind it | `SET lock_timeout = '3s'` on migrations; retry |
+| Upserts on multiple unique keys in different orders | Sort input rows by key before multi-row `INSERT ... ON CONFLICT` |
+
+Diagnostics:
+
+```sql
+-- postgresql.conf / parameter group
+-- log_lock_waits = on          (logs waits longer than deadlock_timeout)
+-- deadlock_timeout = 1s
+
+-- Who is blocking whom right now
+SELECT blocked.pid AS blocked_pid, blocked.query AS blocked_query,
+       blocking.pid AS blocking_pid, blocking.query AS blocking_query,
+       now() - blocking.xact_start AS blocking_tx_age
+FROM pg_stat_activity blocked
+JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+JOIN pg_stat_activity blocking ON blocking.pid = b.pid;
+
+-- Deadlock counter (graph this)
+SELECT datname, deadlocks FROM pg_stat_database;
+```
+
+### Testing race conditions
+
+Don't hope — hammer it:
+
+```ts
+test('cannot oversell last unit under concurrency', async () => {
+  await seedInventory({ skuId: 'SKU-1', available: 1 });
+  const results = await Promise.allSettled(
+    Array.from({ length: 50 }, () => placeOrder({ skuId: 'SKU-1', qty: 1 })),
+  );
+  const succeeded = results.filter((r) => r.status === 'fulfilled');
+  expect(succeeded).toHaveLength(1);
+  expect(await getAvailable('SKU-1')).toBe(0);
+});
+```
+
+Run against a real PostgreSQL (Testcontainers), with a pool size > 1, not against mocks or SQLite.
+
+### Expert Mental Model
+
+> "Any read that informs a write is a potential race. I either make the check and the write one atomic statement, lock what I read, or let the database detect conflicts and retry — and I put a constraint underneath all of them."
+
+### Common Mistake
+
+```ts
+const { available } = await db.one('SELECT available FROM inventory WHERE sku_id = $1', [sku]);
+if (available >= qty) {
+  await db.none('UPDATE inventory SET available = $1 WHERE sku_id = $2', [available - qty, sku]); // lost update
+}
+```
+
+And: using Redis `GET`/`SET` "locks" without fencing tokens for correctness-critical mutual exclusion; or an application-level mutex in a single Node process, which does nothing across replicas.
+
+---
+
+## 19. Capacity Exhaustion: Pools, Disk, File Descriptors, Memory
+
+### What
+
+Every system has finite resources. Capacity exhaustion occurs when a resource reaches its limit, typically causing sudden, non-linear failure (a cliff, not a slope).
+
+### Why
+
+Resource limits create **cliffs**: at 95% pool usage everything is fine; at 100% requests queue, latency explodes, timeouts trigger retries, and the system falls over. Many resources also **fail far from the cause**: a full disk manifests as "PostgreSQL refuses writes" or "the logging agent crashed".
+
+### How — the resource inventory
+
+| Resource | Typical failure | Signals to monitor | Mitigations |
+|---|---|---|---|
+| **DB connections** (server `max_connections`) | `FATAL: sorry, too many clients already` | `numbackends` / max, pool waiting count | PgBouncer (transaction pooling), right-size per-instance pools: `instances × pool.max < max_connections − reserved` |
+| **App connection pool** | Requests wait for connection, then time out | pool `waitingCount`, acquisition latency | `connectionTimeoutMillis`, fix slow queries, don't hold connections across awaits of network calls |
+| **Disk** | DB stops, logs lost, container evicted | % used, **time-to-full** projection, inode usage | Alerts at 80%/90% + growth rate, log rotation, autovacuum health, retention jobs, separate volumes for data/logs |
+| **File descriptors** | `EMFILE: too many open files` | open FDs vs `ulimit -n` | Raise limits (`LimitNOFILE`), keep-alive agents with max sockets, close streams in `finally` |
+| **Ephemeral ports** | `EADDRNOTAVAIL` on outbound connects | TIME_WAIT sockets count | Connection reuse (keep-alive), pooling |
+| **Memory** | OOM kill, GC thrash | RSS vs limit, heap used, GC pause time | Streaming, bounded caches (LRU with max), size limits on inputs, `--max-old-space-size` aligned with container limit |
+| **CPU / event loop** | Latency spikes, health check failures | CPU throttling, event-loop lag | Offload CPU work to worker threads/jobs, concurrency limits |
+| **Queue depth** | Growing lag, stale work | Age of oldest message | Scale consumers, shed/expire, producer rate limits |
+| **Transaction IDs (PostgreSQL)** | Wraparound protection → DB refuses writes | `age(datfrozenxid)` | Healthy autovacuum, no long-running transactions |
+| **Third-party quotas** | 429s, account suspension | Quota usage headers | Client-side rate limiting, caching, request batching |
+| **Sequences / ID space** | `integer` PK overflow at 2,147,483,647 | `max(id)` / type limit | Use `bigint` for PKs from day one |
+| **Certificates / tokens** | TLS failures when certs expire | Days to expiry | Automated renewal (ACME), expiry alerts at 30/14/7 days |
+
+### Example — pool sizing arithmetic
+
+```text
+PostgreSQL max_connections        = 200
+Reserved (superuser, admin, repl) = 20
+Available for apps                = 180
+
+Web:     12 pods × pool.max 10 = 120
+Workers:  4 pods × pool.max  8 =  32
+Cron:     1 pod  × pool.max  5 =   5
+Migrations/one-off             =   5
+Total                          = 162  ✓ (headroom for surge during rolling deploy?)
+
+Rolling deploy with maxSurge 25%: web temporarily 15 pods × 10 = 150 → total 192 ✗ over 180
+→ Fix: PgBouncer in transaction mode, or reduce pool.max to 8, or maxSurge 1 pod.
+```
+
+### Example — Node pool instrumentation
+
+```ts
+setInterval(() => {
+  metrics.dbPoolTotal.set(pool.totalCount);
+  metrics.dbPoolIdle.set(pool.idleCount);
+  metrics.dbPoolWaiting.set(pool.waitingCount);   // > 0 sustained = saturation
+}, 5000).unref();
+```
+
+### Example — Prometheus alerts for exhaustion
+
+```yaml
+groups:
+  - name: capacity
+    rules:
+      - alert: DiskWillFillIn6Hours
+        expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/var/lib/postgresql"}[1h], 6 * 3600) < 0
+        for: 10m
+        labels: { severity: page }
+      - alert: DbPoolSaturated
+        expr: max_over_time(db_pool_waiting[5m]) > 0 and avg_over_time(db_pool_waiting[5m]) > 2
+        for: 5m
+        labels: { severity: page }
+      - alert: FileDescriptorsHigh
+        expr: process_open_fds / process_max_fds > 0.8
+        for: 10m
+        labels: { severity: ticket }
+      - alert: PostgresXidWraparoundRisk
+        expr: pg_database_age_datfrozenxid > 1.0e9
+        labels: { severity: page }
+      - alert: CertificateExpiresSoon
+        expr: probe_ssl_earliest_cert_expiry - time() < 14 * 86400
+        labels: { severity: ticket }
+```
+
+### Expert Mental Model
+
+> "For every finite resource: what's the limit, how close are we, how fast are we approaching it, and what fails first when we hit it?"
+
+### Common Mistake
+
+- Monitoring **utilization** but not **saturation** (CPU 60% average hides 100% bursts; pool "total = max" isn't alarming but "waiting > 0" is).
+- Static "disk > 90%" alerts that fire at 3 a.m. for a disk that takes 3 months to fill, and miss a disk that fills from 50% to 100% in 20 minutes. Use time-to-full.
+- Increasing `max_connections` to 2,000 to "fix" pool exhaustion (each PostgreSQL connection is a process with memory overhead; performance collapses).
+
+---
+
+## 20. Recovery: Detect, Contain, Repair, Learn
+
+### What
+
+Recovery is everything from "something is wrong" to "we're back, the damage is repaired, and it's less likely to recur".
+
+### Why
+
+Mean time to recovery (MTTR) often matters more than mean time between failures (MTBF). Systems that fail occasionally but recover in 2 minutes beat systems that fail rarely but take 2 days to recover and repair data.
+
+### How
+
+```text
+DETECT     SLO burn-rate alerts, business-metric alerts, reconciliation jobs, synthetic checks, customer reports (worst)
+   ↓
+TRIAGE     Severity, blast radius (which tenants/regions/journeys), recent changes (deploys, flags, config)
+   ↓
+CONTAIN    Flip kill switch, roll back, shed load, fail over, block abusive tenant, pause consumers
+   ↓
+RESTORE    Service back within SLO (may be degraded)
+   ↓
+REPAIR     Fix data: replay from outbox/DLQ, reconcile with provider, repair scripts, targeted PITR
+   ↓
+VERIFY     Invariant checks pass, reconciliation clean, customer-facing state correct
+   ↓
+LEARN      Blameless postmortem, action items with owners, new tests/alerts/constraints/runbooks
+```
+
+Automated recovery mechanisms worth building:
+
+| Mechanism | What it recovers |
+|---|---|
+| Reconciliation job (e.g. hourly compare PSP charges ↔ orders) | Unknown outcomes, lost webhooks, partial failures |
+| Stuck-state sweeper (entities in intermediate states past SLA) | Crashed workflows, lost messages |
+| Outbox lag alert + relay restart | Event publication stalls |
+| DLQ alert + redrive tooling | Poison messages after fix |
+| Self-healing orchestration (k8s restarts, autoscaling) | Crashed processes, load growth |
+| Automatic rollback on canary failure | Bad deploys |
+
+Example reconciliation (payments):
+
+```sql
+-- Charges captured at the PSP (imported hourly into psp_charges) with no matching paid order
+SELECT c.psp_charge_id, c.amount_minor, c.metadata->>'order_id' AS order_id, c.created_at
+FROM psp_charges c
+LEFT JOIN payments p ON p.psp_charge_id = c.psp_charge_id
+WHERE c.status = 'succeeded'
+  AND c.created_at < now() - interval '15 minutes'
+  AND p.id IS NULL;
+-- Each row → attach to order if order exists and is awaiting payment, else auto-refund + alert.
+```
+
+Every alert links to a runbook ([templates/runbook.md](templates/runbook.md)); every significant incident gets a postmortem ([templates/postmortem.md](templates/postmortem.md)) whose action items become **mechanisms** (constraints, tests, CI checks, alerts), not "be more careful" — see [10-knowledge-into-systems.md](10-knowledge-into-systems.md).
+
+### Expert Mental Model
+
+> "Assume some failures will slip past every defense. The last line of defense is a system that notices inconsistency on its own and a team that has practiced repairing it."
+
+### Common Mistake
+
+- Declaring an incident resolved when the error rate drops, without repairing data created during the incident.
+- Postmortem action items like "add more logging" and "be careful with migrations".
+
+---
+
+## 21. Worked FMEA: Payment/Checkout Flow
+
+FMEA (Failure Mode and Effects Analysis) systematically lists how each step can fail, the effect, how likely it is, how severe, how detectable, and what mitigates it. A simple **Risk Priority Number (RPN) = Severity × Occurrence × Detection** (each 1–10; for Detection, 10 = hardest to detect) helps rank what to fix first. Use [templates/failure-mode-analysis.md](templates/failure-mode-analysis.md).
+
+### System under analysis
+
+```text
+[Browser: Next.js checkout page]
+      │ POST /api/checkout (Idempotency-Key)
+      ▼
+[Checkout API] ──► [PostgreSQL: carts, orders, inventory, payments, outbox]
+      │
+      ├──► [Tax service]            (sync, 2s timeout)
+      ├──► [PSP: create PaymentIntent / confirm]  (sync, 8s timeout, idem key)
+      │
+      ◄─── [PSP webhooks: payment_intent.succeeded / failed]  (async, at-least-once, signed)
+      │
+[Outbox relay] ──► [Queue] ──► [Fulfillment worker] ──► [WMS]
+                          └──► [Email worker] ──► [Email provider]
+```
+
+Flow: validate cart → reserve inventory (tx) → compute tax → create order `pending_payment` + PaymentIntent with idem key → client confirms (3DS if needed) → webhook marks order `paid` (inbox dedup) → outbox `order.paid` → fulfillment and email.
+
+### FMEA table
+
+| # | Step | Failure mode | Effect | S | O | D | RPN | Mitigations (existing → added) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Submit checkout | User double-clicks / client retries after timeout | Duplicate orders & charges | 9 | 7 | 4 | 252 | Idempotency-Key per intent; `UNIQUE(cart_id)` on orders; PSP idempotency key `pi:<orderId>` |
+| 2 | Price calculation | Client-supplied price trusted | Undercharging / fraud | 9 | 4 | 7 | 252 | Server recomputes all prices from DB; amounts in integer minor units; see [08-security-engineering.md](08-security-engineering.md) |
+| 3 | Reserve inventory | Concurrent last-unit purchases | Oversell | 7 | 6 | 5 | 210 | Atomic conditional `UPDATE ... WHERE available >= qty`; `CHECK (available >= 0)`; concurrency test |
+| 4 | Reserve inventory | Reservation never released (abandoned checkout, crash) | Phantom out-of-stock | 5 | 8 | 6 | 240 | Reservations with `expires_at`; sweeper releases expired every minute; metric of expired reservations |
+| 5 | Tax API | Timeout / 5xx | Checkout blocked | 7 | 4 | 2 | 56 | 2s timeout, 1 retry w/ jitter, breaker; fallback to cached rate table **only** if legal approves + flag order for reconciliation |
+| 6 | Tax API | Malformed 200 response | Wrong tax collected | 8 | 2 | 8 | 128 | zod schema validation; reject instead of default; business alert on tax/order ratio anomaly |
+| 7 | Create PaymentIntent | PSP timeout — outcome unknown | Possible orphan intent | 6 | 4 | 5 | 120 | Same idem key on retry returns same intent; reconciliation job |
+| 8 | Confirm payment | Charge succeeds; response lost; client shows error | User retries, or thinks payment failed | 8 | 5 | 5 | 200 | Idempotent confirm; order page polls order status (source of truth = webhook-updated DB); "payment processing" UI state |
+| 9 | Webhook | Webhook delivered twice | Double fulfillment / double email | 7 | 8 | 3 | 168 | Inbox dedup on PSP event ID; state machine only allows `pending_payment → paid` |
+| 10 | Webhook | Webhook lost / endpoint down for hours | Paid order stuck `pending_payment`; may be auto-cancelled while money taken | 9 | 3 | 6 | 162 | PSP retries for days; our reconciliation polls PSP for intents in `pending_payment` > 10 min; never auto-cancel without checking PSP |
+| 11 | Webhook | Forged webhook | Free goods | 10 | 3 | 7 | 210 | Signature verification with raw body + timestamp tolerance; re-fetch event from PSP API for high-value orders |
+| 12 | Webhook | Out-of-order events (`failed` arrives after `succeeded`) | Paid order marked failed | 8 | 3 | 6 | 144 | State machine rejects illegal transitions; use event `created` timestamp / re-fetch current PaymentIntent status |
+| 13 | Mark paid + outbox | Process crash between DB update and publish | Order paid, never fulfilled | 9 | 3 | 7 | 189 | Outbox in same tx; outbox lag alert; stuck `paid` without `fulfillment_started` sweeper |
+| 14 | Fulfillment worker | Poison message (unknown SKU in WMS) | Consumer loops, blocks partition | 6 | 3 | 4 | 72 | Error classification → DLQ; DLQ alert; redrive runbook |
+| 15 | Email | Provider outage | No confirmation emails | 3 | 4 | 3 | 36 | Queue with retries (24h); degraded but order unaffected |
+| 16 | Database | Primary failover mid-checkout | Some checkouts error; some commit with unknown outcome | 7 | 2 | 3 | 42 | Retry on connection errors with idempotency; client re-checks order status |
+| 17 | Database | Pool exhaustion from slow report queries | All checkouts time out | 9 | 3 | 3 | 81 | Bulkhead: separate pool/role/replica for reports; `statement_timeout` |
+| 18 | Deploy | Incompatible migration during rollout | Checkout 500s for minutes | 8 | 3 | 2 | 48 | Expand/contract; squawk lint; canary with checkout success-rate guardrail |
+| 19 | Refund/cancel | Cancel after capture fails to refund | Customer charged for cancelled order | 9 | 2 | 6 | 108 | Saga compensation with retry; `refund_pending` state; daily reconciliation cancelled-but-captured |
+| 20 | Currency/amounts | Floating-point rounding | Totals don't reconcile | 7 | 3 | 7 | 147 | Integer minor units; `numeric` in SQL; invariant: `sum(line totals) + tax + shipping − discounts = order total` checked in code + nightly |
+| 21 | Traffic spike (flash sale) | Overload | Everyone times out | 9 | 4 | 2 | 72 | Waiting room / load shedding by priority; pre-scaling; inventory reservations limit concurrency |
+| 22 | Fraud | Card testing via checkout endpoint | PSP fees, account risk | 7 | 5 | 4 | 140 | Rate limits per IP/account/card fingerprint; CAPTCHA on anomalies; PSP Radar rules |
+
+### What the FMEA tells you to build first
+
+Sorted by RPN, the top items are idempotency (1), server-side pricing (2), reservation expiry (4), oversell protection (3), and webhook authenticity (11). Notice most high-RPN items share two properties: **high severity (money)** and **poor detectability without deliberate reconciliation**. That's why mature payment systems invest disproportionately in reconciliation — it converts "undetectable" (D=8) into "detected within an hour" (D=3) for an entire class of failures at once.
+
+### Test plan derived from the FMEA
+
+| FMEA # | Test type | Test |
+|---|---|---|
+| 1 | Integration | Same Idempotency-Key ×20 concurrent → 1 order, 1 PaymentIntent, identical responses |
+| 3 | Concurrency | 50 parallel checkouts for last unit → exactly 1 succeeds |
+| 9 | Integration | Deliver same webhook event 3× → 1 state change, 1 outbox event |
+| 10 | Fault injection | Drop webhooks; reconciliation marks order paid within 15 min |
+| 11 | Security | Tampered signature / stale timestamp → 400, no state change |
+| 12 | Unit (state machine) | `paid → failed` transition rejected |
+| 13 | Crash test | Kill process after commit before relay → event still published after restart |
+| 17 | Load | Run report load + checkout load → checkout p95 unaffected |
+| 20 | Property-based | Random carts/discounts/taxes → totals always reconcile |
+
+---
+
+## 22. Amateur vs Professional vs Expert
+
+| Topic | Amateur | Professional | Expert |
+|---|---|---|---|
+| Mindset | Codes the happy path; errors are exceptions | Adds try/catch, retries, and logging | Enumerates failure outcomes per boundary; designs so each is harmless, detectable, and repairable |
+| Timeouts | Library defaults (often none) | Sets timeouts on HTTP calls | Deadline propagated end-to-end; timeouts derived from measured latency; layered correctly |
+| Retries | `for` loop with fixed sleep | Exponential backoff | Backoff + full jitter + retry budget + single retry layer + retry only idempotent/classified errors |
+| Duplicates | Doesn't consider them | Disables the button; checks "exists" before insert | Idempotency keys, inbox dedup, unique constraints; treats every delivery as at-least-once |
+| Multi-system writes | Write DB then publish | Wraps in try/catch and "rolls back" manually | Transactional outbox; sagas with idempotent compensations; reconciliation |
+| Concurrency | Read-then-write in app code | `SELECT ... FOR UPDATE` sometimes | Atomic statements, constraints as backstop, deliberate isolation levels, concurrency tests against real DB |
+| Dependencies | All dependencies are critical | Circuit breaker on some | Criticality classification per journey; bulkheads; defined degraded modes that are tested |
+| Overload | "We'll autoscale" | Rate limits | Bounded queues, priority load shedding, backpressure, adaptive concurrency |
+| Deploys | Big-bang, migration + code together | Rolling deploy, sometimes breaks | Expand/contract, migration lint, canaries with automatic rollback, flags as kill switches |
+| Data safety | "The cloud backs it up" | Daily snapshots | RPO/RTO per data class, PITR, immutable cross-account copies, automated restore verification |
+| Detection | Customers report problems | Error-rate alerts | SLO burn alerts + business-metric alerts + reconciliation + stuck-state sweepers |
+| After incidents | Fix the bug | Postmortem with action items | Action items become mechanisms (constraints, tests, CI gates, alerts); FMEA updated |
+
+How to recognize the level in a code review:
+- **Amateur PR:** `await externalCall()` with no timeout inside a transaction.
+- **Professional PR:** timeout and retry added, but POST retried without an idempotency key.
+- **Expert PR:** description includes "failure modes considered", links the FMEA row, adds a concurrency test and an alert, and the migration is expand-only.
+
+---
+
+## 23. Key Takeaways
+
+1. **A timeout is an unknown outcome, not a failure.** Design ways to resolve unknowns: idempotency keys, status queries, reconciliation.
+2. **Assume at-least-once everywhere.** Make every consumer and every write path idempotent; back it with unique constraints.
+3. **Inside one database, use transactions aggressively; across systems, use outbox + inbox + sagas.** Never make a network call inside a DB transaction.
+4. **Every I/O has a timeout derived from a propagated deadline.** Zombie work after the client gave up is pure waste that amplifies overload.
+5. **Retries are load amplifiers.** Use backoff with jitter, a retry budget, a single retry layer, and only retry classified transient errors.
+6. **Break cascades** with circuit breakers, bulkheads, bounded queues, and priority load shedding. Rejecting some work quickly beats failing all work slowly.
+7. **Define degraded modes as product decisions in advance** and test them; fallbacks must never violate invariants.
+8. **Deployments are the top incident trigger.** Old and new code coexist: expand/contract, lint migrations, canary, and keep kill switches.
+9. **Only verified restores count.** Set RPO/RTO per data class, keep an immutable copy outside the blast radius, and drill restores automatically.
+10. **Race conditions are guaranteed under concurrency.** Prefer atomic statements, lock ordering, constraints, and serializable-with-retry; test with real parallelism.
+11. **Watch saturation and time-to-exhaustion**, not just utilization.
+12. **Reconciliation is the universal safety net** that converts undetectable failures into detected, repairable ones.
+
+---
+
+## 24. Self-Assessment Checklist
+
+Use this against a real service you own:
+
+- [ ] Every outbound HTTP/DB/queue call has an explicit timeout, and inner timeouts are shorter than outer ones.
+- [ ] Request deadlines propagate to downstream services and DB statement timeouts.
+- [ ] All non-idempotent public write endpoints accept an `Idempotency-Key`, compare request hashes, and handle concurrent duplicates.
+- [ ] No network calls happen inside database transactions.
+- [ ] Events are published via a transactional outbox; consumers deduplicate via an inbox or natural idempotency.
+- [ ] Retries use exponential backoff with jitter, respect `Retry-After`, have a budget, and happen at one layer only.
+- [ ] Optional dependencies have circuit breakers and tested fallbacks; critical dependencies are explicitly listed.
+- [ ] DB pools are separated by workload, and total connections stay under `max_connections` even during deploy surge.
+- [ ] Every queue has a DLQ, a DLQ-not-empty alert, an oldest-message-age alert, and a redrive runbook.
+- [ ] Multi-step cross-system workflows have explicit states, compensations, and a stuck-state sweeper.
+- [ ] Migrations are expand/contract, linted in CI, and use `CONCURRENTLY` / `NOT VALID` / `lock_timeout` where needed.
+- [ ] Risky features ship behind flags with safe defaults and a removal date; kill switches are tested.
+- [ ] RPO/RTO are written down per data class; a restore was performed, timed, and validated in the last 30 days.
+- [ ] Balance/stock/uniqueness invariants are enforced by DB constraints and tested under real concurrency.
+- [ ] Lock ordering is consistent for multi-row updates; deadlocks and lock waits are logged and graphed.
+- [ ] Alerts exist for pool saturation, disk time-to-full, FD usage, XID age, and certificate expiry.
+- [ ] Reconciliation jobs compare your records with external providers and alert on mismatches.
+- [ ] An FMEA exists for the most critical user journey, and its top-RPN items have tests.

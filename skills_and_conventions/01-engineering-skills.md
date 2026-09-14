@@ -1276,4 +1276,339 @@ Decision:      (a) graphile-worker. Revisit trigger: sustained > 300 jobs/s or q
 
 ---
 
-<!-- CONTINUE -->
+## 5. Tool Knowledge vs Engineering Ability
+
+### What
+
+- **Tool knowledge** is knowing *what a specific technology does and how to operate it*: APIs, syntax, configuration flags, CLI commands, framework conventions.
+- **Engineering ability** is knowing *what the system needs and why*, independent of any tool: invariants, boundaries, failure modes, trade-offs, data flow, and how to verify behavior.
+
+Tool knowledge answers **"How do I do X in Y?"**
+Engineering ability answers **"Should we do X at all? What happens when X fails? What must remain true while X happens?"**
+
+### Why the distinction matters
+
+1. **Tools change every few years; engineering fundamentals change every few decades.** Transactions, idempotency, caching trade-offs, and least privilege were as true in 1995 as today.
+2. **Tool knowledge is now cheap.** Documentation, search, and AI assistants can produce correct API usage in seconds. Engineering judgment — knowing that the generated code has a race condition — is not cheap. See [13-ai-and-agents.md](13-ai-and-agents.md).
+3. **Hiring and self-assessment get distorted.** A list of 25 technologies says little about whether someone can design a system that doesn't lose money under retries.
+4. **Tool-first thinking produces framework-driven architecture** — where the shape of the system is dictated by a library's tutorials rather than the domain (see [17-common-failure-modes.md](17-common-failure-modes.md)).
+
+### How to recognize the difference
+
+Ask a question that the tool's documentation doesn't answer.
+
+| Question | Tool-knowledge answer | Engineering-ability answer |
+|---|---|---|
+| "How do you prevent duplicate orders?" | "Disable the submit button after click." | "The button helps UX, but the guarantee must be server-side: client-generated idempotency key, unique constraint, stored response replay. Networks retry; users open two tabs." |
+| "How do you make this page faster?" | "Use `React.memo` and `useMemo`." | "Measure first. Is it TTFB, JS execution, hydration, or layout shift? The flamegraph says 70% is a 900KB charting library loaded on first paint — lazy-load it." |
+| "How do you secure this API?" | "Add JWT middleware." | "Authentication proves identity; the vulnerability class that matters is object-level authorization. Every query is tenant-scoped; RLS as a backstop; tests that try cross-tenant access." |
+| "How do you handle a failing third-party API?" | "Wrap it in try/catch and retry." | "Timeout budget smaller than our own SLO, retries only for idempotent calls with jittered backoff, circuit breaker, a degraded mode, and an alert when fallback rate exceeds 5%." |
+| "Should we use Kafka?" | "Yes, it's scalable." | "What's the event volume, ordering need, retention need, and who operates it? At 20 events/sec with a single consumer, a Postgres outbox + worker is simpler and transactional." |
+
+### Contrast pairs
+
+These pairs illustrate the gap. The left side is valuable — but insufficient.
+
+**Frontend (React / Next.js)**
+
+> Knowing React is not the same as knowing how to architect a frontend.
+
+| Tool knowledge | Engineering ability |
+|---|---|
+| Knows hooks, context, Server Components, `use client` | Decides where state lives: server state (cached, refetched) vs URL state (shareable, back-button safe) vs local UI state vs global client state — and why mixing them causes bugs |
+| Knows `fetch` with `revalidate` in Next.js | Designs a cache invalidation strategy tied to domain events; knows which data may be stale for 60s (catalog) and which may never be (cart total, stock at checkout) |
+| Knows how to build a form with React Hook Form + Zod | Knows client validation is UX only; shares the Zod schema with the server action but still re-validates and authorizes server-side; handles double submits and optimistic updates rollback |
+| Knows Tailwind and a component library | Builds a design system with tokens, accessible primitives, and composition rules so 40 screens stay consistent |
+| Can make a component render | Designs component boundaries to minimize client JS, isolate re-renders, and keep the server/client boundary intentional |
+| Knows `next/image` | Sets performance budgets (LCP < 2.5s, INP < 200ms, CLS < 0.1) and fails CI when exceeded |
+
+**Databases (PostgreSQL)**
+
+> Knowing PostgreSQL syntax is not the same as knowing how to design a reliable data system.
+
+| Tool knowledge | Engineering ability |
+|---|---|
+| Writes `JOIN`s, CTEs, window functions | Designs schemas where invariants are constraints, not comments |
+| Knows `CREATE INDEX` | Knows index column order, partial indexes, write amplification, and when an index won't be used |
+| Knows `BEGIN/COMMIT` | Knows which anomalies `READ COMMITTED` allows and designs each critical write accordingly |
+| Knows `pg_dump` | Has a tested restore procedure with measured RTO/RPO and point-in-time recovery |
+| Knows `ALTER TABLE` | Runs expand/contract migrations on a 500M-row table without downtime |
+| Knows Prisma/Drizzle APIs | Knows the SQL those APIs emit and when it's wrong |
+
+**Backend (Node.js)**
+
+> Knowing Node.js is not the same as knowing how to design a resilient backend.
+
+| Tool knowledge | Engineering ability |
+|---|---|
+| Knows Express/Fastify/NestJS routing | Designs the request lifecycle: auth → validation → authorization → domain → persistence → events → response, with consistent errors at each step |
+| Knows `async/await` | Knows that an `await` is a point where other requests interleave; designs atomic operations |
+| Knows `setTimeout`, workers | Designs graceful shutdown: stop accepting, drain in-flight requests, finish or requeue jobs, close pools |
+| Knows `axios` | Sets timeouts, retry policy, circuit breaking, connection reuse, and propagates deadlines |
+| Knows `process.env` | Validates config at startup and fails fast with clear errors |
+
+**Infrastructure and operations**
+
+| Tool knowledge | Engineering ability |
+|---|---|
+| Knows Docker and Kubernetes manifests | Knows what liveness vs readiness probes should actually check, and how a bad probe causes cascading restarts |
+| Knows Terraform syntax | Designs state isolation, blast radius per workspace, and safe apply workflows |
+| Knows how to set up Datadog/Grafana | Defines SLIs that reflect user experience and alerts that are actionable |
+| Knows GitHub Actions YAML | Designs a pipeline whose gates correspond to real risks, runs under 10 minutes, and supports instant rollback |
+| Knows Redis commands | Knows Redis is not durable by default, knows eviction policies, and never makes it the source of truth for money |
+
+**Security**
+
+| Tool knowledge | Engineering ability |
+|---|---|
+| Knows how to configure NextAuth/Auth.js, Clerk, or Cognito | Knows session fixation, token lifetime trade-offs, refresh token rotation, and where authorization decisions belong |
+| Knows `bcrypt` | Knows password storage is one control among many: rate limiting, credential stuffing defense, MFA, breach detection |
+| Knows `helmet()` | Knows what each header mitigates and designs a CSP that doesn't need `unsafe-inline` |
+
+**Testing**
+
+| Tool knowledge | Engineering ability |
+|---|---|
+| Knows Jest/Vitest/Playwright APIs | Designs a test portfolio mapped to risk: what fails most expensively, and what's the cheapest test that catches it |
+| Can mock modules | Knows when mocks make tests lie and uses real dependencies (Testcontainers) instead |
+
+### The layered relationship
+
+Tool knowledge is not useless — it is the **execution layer** of engineering ability.
+
+```text
+Engineering ability  →  decides WHAT must be true and WHY
+        │
+        ▼
+Design/architecture  →  decides WHERE and HOW it is enforced
+        │
+        ▼
+Tool knowledge       →  implements it correctly and efficiently in a specific technology
+```
+
+An engineer with ability but weak tool knowledge is slow for a few weeks. An engineer with tool knowledge but weak ability is fast until production, then expensive for years.
+
+### Example — same requirement, two engineers, same stack
+
+**Requirement (logistics SaaS):** "Customers can upload a CSV of up to 50,000 shipments to create them in bulk."
+
+**Tool-knowledge implementation (Next.js route handler):**
+
+```ts
+export async function POST(req: Request) {
+  const text = await req.text();
+  const rows = parse(text);                  // loads entire file into memory
+  for (const row of rows) {
+    await prisma.shipment.create({ data: row }); // 50,000 sequential inserts, no validation
+  }
+  return Response.json({ ok: true });         // request times out at 60s on the platform
+}
+```
+
+Problems: platform timeout, memory spikes, partial imports with no way to know which rows succeeded, re-upload creates duplicates, no validation, no per-tenant limits, no progress.
+
+**Engineering-ability implementation:**
+
+1. **Upload** directly to object storage via presigned URL (file never passes through the app server).
+2. **Create an `import_jobs` row** (`status: pending`, `tenant_id`, `file_key`, `checksum`). Unique on `(tenant_id, checksum)` → the same file can't be imported twice accidentally.
+3. **Worker** streams the CSV, validates each row with a Zod schema, writes in batches of 500 inside transactions, and upserts on `(tenant_id, external_reference)` for idempotency.
+4. **Row-level results** stored in `import_job_errors` (row number, field, code) so the UI can show "49,812 created, 188 rejected — download error report."
+5. **Progress** exposed via polling endpoint; the Next.js page shows a progress bar.
+6. **Limits:** max file size, max rows, per-tenant concurrency of 1 import.
+7. **Observability:** job duration, rows/sec, rejection rate metrics; logs include `import_job_id`.
+8. **Tests:** a 50k-row fixture in CI's slow tier; a test that re-running a partially completed job produces no duplicates.
+
+Same tools. Entirely different system.
+
+### Expert Mental Model
+
+> "Tools are how I express a decision. They are never the decision. If I can't describe the solution without naming a product, I don't understand the problem yet."
+
+### Common Mistake
+
+Measuring growth by *number of technologies learned*. The fastest path to seniority is to go deep on the **transferable concepts underneath** the tools you already use — the transaction model underneath Prisma, the rendering model underneath Next.js, the delivery semantics underneath your queue.
+
+---
+
+## 6. How Skills Compound
+
+Skills are not independent. They form clusters where weakness in one caps the value of the others.
+
+```text
+                 ┌──────────────────────────────┐
+                 │ Technical Decision-Making    │  governs how all skills are applied
+                 └──────────────┬───────────────┘
+        ┌───────────────────────┼────────────────────────┐
+        ▼                       ▼                        ▼
+ ┌─────────────┐        ┌──────────────┐         ┌──────────────┐
+ │ Domain      │───────▶│ Architecture │────────▶│ System Design│
+ │ Modeling    │        └──────┬───────┘         └──────┬───────┘
+ └─────┬───────┘               │                        │
+       ▼                       ▼                        ▼
+ ┌─────────────┐        ┌──────────────┐         ┌──────────────┐
+ │ Database    │◀──────▶│ API Design   │◀───────▶│ Distributed  │
+ │ Engineering │        └──────────────┘         │ Systems      │
+ └─────┬───────┘                                 └──────┬───────┘
+       └──────────────┬──────────────────────────────────┘
+                      ▼
+       Programming · Concurrency · Algorithms   (execution)
+                      ▼
+       Testing · Security · Performance         (verification of properties)
+                      ▼
+       DevOps · Infrastructure · Observability  (operation)
+                      ▼
+       Debugging · Documentation · Code Review  (feedback & knowledge)
+                      ▼
+       Product Engineering · Technical Leadership (direction & scale)
+```
+
+**Compounding examples:**
+
+- **Domain modeling × Database engineering:** A correct state machine in code *plus* a database constraint on legal transitions is dramatically stronger than either alone.
+- **Observability × Debugging:** Debugging skill without telemetry is guesswork; telemetry without debugging skill is unread dashboards.
+- **Testing × Architecture:** Good boundaries make testing cheap; good tests make architectural refactoring safe.
+- **Security × API design:** Most API vulnerabilities (IDOR, mass assignment, excessive data exposure) are API design choices.
+- **Product engineering × Everything:** The cheapest reliable, secure, fast system is the one where unnecessary features were never built.
+
+**Bottleneck rule:** Your system's quality is limited by your weakest skill that the system *actually exercises*. A payments system exercises concurrency, database, security, and distributed systems heavily — weakness in any is fatal. A marketing site exercises frontend performance and accessibility — weakness in distributed systems is irrelevant there.
+
+---
+
+## 7. What Level Is Actually Necessary
+
+Not every skill needs expert depth for professional work. The required level depends on **what the system you build demands** and **whether someone else covers the gap**.
+
+### Baseline for a professional full-stack engineer shipping production business software
+
+| Skill | Minimum professional level | Why that level |
+|---|---|---|
+| Programming | L3 | Others must safely change your code |
+| Algorithms & data structures | L2 | Recognize complexity; rarely implement novel algorithms |
+| System design | L3 | Own features end-to-end in production |
+| Software architecture | L2–L3 | Structure services/apps well; org-level architecture is L4 |
+| Database engineering | L3 | Data correctness and migrations cause most business-software incidents |
+| API design | L3 | Contracts are expensive to change |
+| Distributed systems | L2–L3 | Timeouts, idempotency, at-least-once, outbox are mandatory; consensus is not |
+| Concurrency | L3 | Money, inventory, bookings, quotas all require it |
+| Security | L3 | No acceptable junior tier for authorization bugs |
+| Performance | L2–L3 | Measure-first discipline; deep tuning only when required |
+| Testing | L3 | Must design your own test strategy |
+| Debugging | L3 | Must resolve production issues with telemetry |
+| DevOps | L2–L3 | Understand and fix your pipeline; roll back safely |
+| Cloud / infrastructure | L2 | Understand your runtime environment; L3 if you own it |
+| Observability | L3 if on call | Can't operate what you can't see |
+| Product engineering | L2–L3 | Avoid building the wrong thing |
+| Domain modeling | L3 in complex domains | Model errors are the most expensive to fix later |
+| Code review | L3 to approve | Reviews are a quality gate |
+| Technical leadership | L2 | Communicate clearly and own outcomes |
+| Documentation | L3 | Future you is a stranger |
+| Technical decision-making | L3 | Explicit, proportional, recorded decisions |
+
+### Adjustments by context
+
+| Context | Raise | Can lower |
+|---|---|---|
+| **Solo developer / multiple projects** | Decision-making, documentation, DevOps, product engineering, security (no one else will catch it) | Leadership of others, deep algorithms |
+| **Fintech / payments / banking** | Concurrency, database, distributed systems, security, testing | Frontend animation polish |
+| **High-traffic consumer / social** | Performance, distributed systems, observability, infrastructure | Heavy domain modeling |
+| **Enterprise B2B SaaS** | Domain modeling, authorization/tenancy, API design, data migrations | Extreme performance tuning |
+| **Logistics / WMS** | Domain modeling (state machines), concurrency, integrations, offline/unreliable networks | Global-scale infra |
+| **Developer tools** | API design, documentation, backwards compatibility, DX | Heavy product analytics |
+| **Early-stage startup** | Product engineering, decision-making (reversibility), pragmatic security | Architecture sophistication, scale |
+
+---
+
+## 8. A Deliberate Skill-Development Plan
+
+Skills develop through **deliberate practice with feedback**, not accumulated hours.
+
+### The loop
+
+```text
+Pick one skill at the edge of your ability
+  ↓
+Find a real problem that exercises it (at work, side project, or reproduction)
+  ↓
+Predict the outcome before acting (forces a mental model)
+  ↓
+Act and measure
+  ↓
+Compare prediction vs reality (the gap IS the learning)
+  ↓
+Write down the lesson (journal, ADR, runbook)
+  ↓
+Operationalize it (template, lint rule, checklist, test)
+```
+
+### Twelve-week plan example (backend-leaning full-stack developer)
+
+| Weeks | Skill focus | Practice | Artifact produced |
+|---|---|---|---|
+| 1–2 | Database concurrency | Reproduce lost update & write skew in two `psql` sessions; fix with constraints, `FOR UPDATE`, `SERIALIZABLE` | Notes + a test suite demonstrating each anomaly |
+| 3–4 | Failure design | Add timeouts/retries/idempotency to a side project's external calls; inject latency with toxiproxy | Failure mode analysis ([templates/failure-mode-analysis.md](templates/failure-mode-analysis.md)) |
+| 5–6 | Observability | OpenTelemetry end-to-end; define two SLOs; build a burn-rate alert | Dashboard + runbook |
+| 7–8 | Security | PortSwigger labs on access control and auth; threat-model your own app | Threat model ([templates/threat-model.md](templates/threat-model.md)) + fixed findings |
+| 9–10 | Testing | Property-based tests for pricing/state machine; mutation testing on one module | Mutation score before/after |
+| 11–12 | Decision-making & docs | Write ADRs for 5 existing decisions; write a design doc for next feature before building | ADR log + design doc |
+
+### Feedback sources ranked by signal quality
+
+1. **Production behavior** (incidents, metrics, user behavior) — highest signal, highest cost.
+2. **Code review from someone stronger** — high signal, cheap.
+3. **Automated verification** (tests, mutation testing, load tests, security scanners) — objective, repeatable.
+4. **Predict-then-measure experiments** — cheap and underused.
+5. **Reading postmortems and expert code** — vicarious experience.
+6. **Courses and books** — useful for knowledge layer; weakest for judgment.
+
+---
+
+## 9. Key Takeaways
+
+1. **A skill is a reliable ability to produce good outcomes in a class of problems** — knowledge + mental model + judgment + execution + verification + operationalization.
+2. **Experts differ from seniors mostly at the verification and operationalization layers**: they prove things work and make the right behavior automatic.
+3. **Tool knowledge is the execution layer, not the engineering.** It is increasingly cheap; engineering judgment is not.
+4. **The highest-leverage skills for business software** are database engineering, concurrency, security (especially authorization), domain modeling, testing strategy, and decision-making — because their failures are silent until they're expensive.
+5. **Skills compound and bottleneck.** Your system is limited by the weakest skill it actually exercises.
+6. **Required depth depends on context.** A solo developer must raise decision-making, documentation, security, and DevOps because no one else covers the gaps.
+7. **Develop skills through prediction and measurement**, then encode lessons into conventions and tooling ([02-engineering-conventions.md](02-engineering-conventions.md), [10-knowledge-into-systems.md](10-knowledge-into-systems.md)).
+8. **Recognize level by questions asked, not technologies listed.** Beginners ask "how do I do this in X?"; experts ask "what must stay true, what can fail, and how will we know?"
+
+---
+
+## 10. Self-Assessment Checklist
+
+Answer honestly. Each "no" is a development target.
+
+**Programming & modeling**
+- [ ] I model states as discriminated unions/state machines rather than boolean flags.
+- [ ] I can explain the difference between expected and unexpected errors in my codebase and how each is handled.
+- [ ] I resist abstractions until there are at least three concrete cases.
+
+**Data & concurrency**
+- [ ] I can reproduce a lost-update anomaly in Postgres and name three ways to prevent it.
+- [ ] Every critical business invariant in my current project is enforced by a database constraint, not only application code.
+- [ ] I have performed and timed a real backup restore.
+
+**Distributed systems & failure**
+- [ ] Every outbound network call I own has an explicit timeout.
+- [ ] Every non-idempotent mutation endpoint or webhook handler I own is safe to receive twice.
+- [ ] I can explain the dual-write problem and the outbox pattern.
+
+**Security**
+- [ ] Every data access in my API is scoped by tenant/owner at the query level.
+- [ ] I have tried to access another user's data in my own app, deliberately.
+- [ ] No long-lived production secrets are stored in CI or developer machines.
+
+**Verification & operations**
+- [ ] I measure before optimizing and keep before/after numbers.
+- [ ] My test suite uses a real database for data-access code.
+- [ ] I can answer "what's the p95 latency and error rate of my most important endpoint right now?" in under a minute.
+- [ ] I can roll back my production deployment in under 5 minutes, and I've done it.
+
+**Judgment & knowledge**
+- [ ] My last three significant technical decisions are written down with alternatives and revisit triggers.
+- [ ] I can describe my system's architecture without naming a single framework.
+- [ ] At least one lesson I learned the hard way this year is now enforced by a tool, template, or test.
+
+Next: [02-engineering-conventions.md](02-engineering-conventions.md) — how teams turn recurring decisions into shared defaults.
+
